@@ -1,0 +1,6 @@
+/main
+/assembled.elf
+*.o
+/compile_commands.json
+/.cache/
+.cpptags

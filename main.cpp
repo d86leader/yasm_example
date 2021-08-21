@@ -1,0 +1,257 @@
+#include <cstring>
+#include <iostream>
+#include <memory>
+
+#include <cstdio>
+extern "C" {
+#include <libyasm.h>
+#include <libyasm/bitvect.h>
+//#include <modules/arch/x86/x86arch.h>
+}
+
+template <typename Type, typename Base, typename Module, yasm_module_type type>
+struct YasmModuleTraits {
+    struct Deleter {
+        void operator() (Type* p) {
+            reinterpret_cast<Base*>(p)->module->destroy(p);
+        }
+    };
+    using Unique = std::unique_ptr<Type, Deleter>;
+
+    static auto load_module(const char* kw) -> Module* {
+        void* loaded = yasm_load_module(type, kw);
+        if (!loaded) {
+            throw std::runtime_error(std::string("Could not load module ") + kw);
+        }
+        return reinterpret_cast<Module*>(loaded);
+    }
+
+    static void list_modules() {
+        yasm_list_modules(type, [](const char* name, const char* kw) {
+            std::cout << '"' << name << "\" (" << kw << ")" << std::endl;
+        });
+    }
+
+    template <typename... Args>
+    static auto create(Module* m, Args&&... args) -> Unique {
+        auto* r = m->create(std::forward<Args>(args)...);
+        if (!r) {
+            throw std::runtime_error("Unable to create object");
+        }
+        return Unique(r);
+    }
+};
+
+using YasmArch = YasmModuleTraits<yasm_arch, yasm_arch_base, yasm_arch_module, YASM_MODULE_ARCH>;
+using YasmObjfmt = YasmModuleTraits<yasm_objfmt, yasm_objfmt_base, yasm_objfmt_module, YASM_MODULE_OBJFMT>;
+using YasmDbgfmt = YasmModuleTraits<yasm_dbgfmt, yasm_dbgfmt_base, yasm_dbgfmt_module, YASM_MODULE_DBGFMT>;
+using YasmPreproc = YasmModuleTraits<yasm_preproc, yasm_preproc_base, yasm_preproc_module, YASM_MODULE_PREPROC>;
+
+template <typename Type, Type* (*create) (), void (*destroy) (Type*)>
+class YasmObject {
+    struct Deleter {
+        void operator() (Type* p) {
+            destroy(p);
+        }
+    };
+
+    std::unique_ptr<Type, Deleter> up;
+
+public:
+    YasmObject() : up(create()) {}
+    YasmObject(YasmObject&&) = default;
+
+    operator Type* () {
+        return up.get();
+    }
+
+    operator Type* () const {
+        return up.get();
+    }
+};
+
+using YasmErrwarns = YasmObject<yasm_errwarns, &yasm_errwarns_create, &yasm_errwarns_destroy>;
+using YasmLinemap = YasmObject<yasm_linemap, &yasm_linemap_create, &yasm_linemap_destroy>;
+using YasmSymtab = YasmObject<yasm_symtab, &yasm_symtab_create, &yasm_symtab_destroy>;
+
+void check_errors(const YasmErrwarns& errwarns, const YasmLinemap& linemap)
+{
+    int warning_error = 1; // treat warnings as errors
+    auto print_error = []( const char* filename, unsigned long line, const char* msg
+                         , const char* xref_fn, unsigned long xref_line, const char* xref_msg
+                         ) {
+        std::cerr << filename << ":" << line << " error: " << msg << std::endl;
+        if (!xref_fn or !xref_msg)  return;
+        std::cerr << xref_fn << ":" << xref_line << " error: " << xref_msg << std::endl;
+    };
+    auto print_warning = []( const char* filename, unsigned long line, const char* msg) {
+        std::cerr << filename << ":" << line << " error: " << msg << std::endl;
+    };
+    if (yasm_errwarns_num_errors(errwarns, warning_error) > 0)
+    {
+        yasm_errwarns_output_all
+            ( errwarns, linemap, warning_error
+            , print_error, print_warning);
+        throw std::runtime_error("Exiting because of the above errors");
+    }
+}
+
+template <size_t len>
+auto instruction(const YasmArch::Unique& arch, const char opcode[len])
+    -> yasm_bytecode*
+{
+    yasm_bytecode* bc = nullptr;
+    uintptr_t prefix = 0;
+    auto type = yasm_arch_parse_check_insnprefix
+        ( arch.get()
+        , opcode, len
+        , 1 /* fake line number */
+        , &bc, &prefix
+        );
+    if (type != YASM_ARCH_INSN) {
+        throw std::logic_error("Not an instruction");
+    }
+    if (!bc) {
+        throw std::logic_error("No bytecode generated");
+    }
+    return bc;
+}
+
+auto gen_int3h(const YasmArch::Unique& arch) -> yasm_bytecode*
+{
+    auto* bc = instruction<3>(arch, "int");
+    yasm_insn* insn = yasm_bc_get_insn(bc);
+    // create operand 3h
+    yasm_intnum* value_3 = yasm_intnum_create_uint(3);
+    yasm_expr__item* item_3 = yasm_expr_int(value_3);
+    yasm_expr* expr_3 = yasm_expr_create(YASM_EXPR_IDENT, item_3, nullptr, 1);
+    yasm_insn_operand* op_3 = yasm_operand_create_imm(expr_3);
+    // append to instruction
+    auto* t = yasm_insn_ops_append(insn, op_3);
+    if (!t) {
+        std::cout << "could not append operand" << std::endl;
+    }
+    return bc;
+}
+
+int main()
+{
+    /* initialize dependencies */
+    if (auto r = BitVector_Boot(); r != ErrCode_Ok) {
+        std::cerr << "unable to initializer bitvector" << std::endl;
+        return r;
+    }
+    yasm_intnum_initialize();
+    yasm_floatnum_initialize();
+    yasm_errwarn_initialize();
+
+    const char* output_name = "assembled.elf";
+
+    std::cout << "\navailable arch modules:" << std::endl;
+    YasmArch::list_modules();
+    auto* x86_module = YasmArch::load_module("x86");
+
+    std::cout << "module machines:" << std::endl;
+    auto* machine = x86_module->machines;
+    while (machine->name != nullptr) {
+        std::cout << machine->name << " (" << machine->keyword << ")" << std::endl;
+        machine += 1;
+    }
+
+    yasm_arch_create_error err;
+    auto arch = YasmArch::create(x86_module, "amd64", "nasm", &err);
+    if (err != YASM_ARCH_CREATE_OK) {
+        std::cerr << "Arch create error: " << err << std::endl;
+        return 1;
+    }
+
+    /* create empty errwarns (not sure if really empty) */
+    YasmErrwarns errwarns;
+    /* create identity linemap (not sure if really identity) */
+    YasmLinemap linemap;
+    yasm_linemap_set(linemap, "-", 0, 1, 1);
+//    /* create symbol table for program */
+//    YasmSymtab symtab;
+
+    /* list and create objfmt */
+    std::cout << "\navailable objfmts:" << std::endl;
+    YasmObjfmt::list_modules();
+    auto objfmt = YasmObjfmt::load_module("elf");
+
+    /* list and create dbgfmt */
+    std::cout << "\navailable dbgfmts:" << std::endl;
+    YasmDbgfmt::list_modules();
+    auto dbgfmt = YasmDbgfmt::load_module("null");
+
+    /* create elf-object-file representative */
+    auto* object = yasm_object_create
+        ( "-", output_name, arch.get()
+        , objfmt, dbgfmt
+        );
+
+    auto* symtab = object->symtab;
+
+    std::cout << std::endl;
+    int is_new_section = 0;
+    yasm_section* section_text = yasm_object_get_general(object, ".text", 16, true /* is code */, false /* not bss */, &is_new_section, 1);
+    std::cout << (is_new_section ? ".text created" : ".text already existed") << std::endl;
+    yasm_section* section_rodata = yasm_object_get_general(object, ".rodata", 32, false /* is code */, false /* not bss */, &is_new_section, 1);
+    std::cout << (is_new_section ? ".data created" : ".data already existed") << std::endl;
+
+    yasm_bytecode* empty_bc = x86_module->create_empty_insn(arch.get(), 1);
+    if (auto t = yasm_section_bcs_append(section_text, empty_bc); not t) {
+        std::cerr << "failed to append bytecode to section text" << std::endl;
+    }
+    yasm_symrec* start_sym = yasm_symtab_define_label
+        ( symtab, "_start"
+        , empty_bc, 1, 1 /* fake line */
+        );
+    yasm_symrec_declare(start_sym, YASM_SYM_GLOBAL, 1 /* fake line */);
+
+    yasm_bytecode* code_bc = gen_int3h(arch);
+    if (auto t = yasm_section_bcs_append(section_text, code_bc); not t) {
+        std::cerr << "failed to append bytecode to section text" << std::endl;
+    }
+
+    constexpr const char content_str_lit[] = "kto prochital tot objdump";
+    auto* content_str = (char*)yasm_xmalloc(std::size(content_str_lit));
+    std::strcpy(content_str, content_str_lit);
+    yasm_dataval* string_val = yasm_dv_create_string(content_str, std::size(content_str_lit) - 1);
+    auto* datavals = (yasm_datavalhead*)yasm_xmalloc(sizeof(yasm_datavalhead));
+    yasm_dvs_initialize(datavals);
+    yasm_dvs_append(datavals, string_val);
+
+    std::cout << "\nbytecode appended to data:" << std::endl;
+    yasm_dvs_print(datavals, stdout, 0);
+    auto* data_bc = yasm_bc_create_data
+        ( datavals, std::size(content_str_lit)
+        , 0 /* do not append zero */
+        , arch.get(), 1
+        );
+
+    if (auto t = yasm_section_bcs_append(section_rodata, data_bc); not t) {
+        std::cerr << "failed to append bytecode to section data" << std::endl;
+    }
+
+    /* Finalize after adding bytecode */
+    yasm_symtab_parser_finalize(symtab, 0, errwarns);
+    check_errors(errwarns, linemap);
+    yasm_object_finalize(object, errwarns);
+    check_errors(errwarns, linemap);
+
+    /* Optimize */
+    yasm_object_optimize(object, errwarns);
+    check_errors(errwarns, linemap);
+
+    /* Generate any debugging information */
+    yasm_dbgfmt_generate(object, linemap, errwarns);
+    check_errors(errwarns, linemap);
+
+    /* Write to file */
+    FILE* output = fopen(output_name, "wb");
+    yasm_objfmt_output(object, output, 0, errwarns);
+    fclose(output);
+    check_errors(errwarns, linemap);
+
+    return 0;
+}
