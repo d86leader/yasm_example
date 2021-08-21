@@ -12,3 +12,9 @@ main-shared: main.o
 
 %.o: %.c $(YASM_DIR)/libyasm.a
 	${CC} -o $@ $^ -Wall -Wextra -Wpedantic -I$(YASM_DIR)
+
+assembled.o: main
+	./$<
+
+assembled: assembled.o
+	ld $< -o $@

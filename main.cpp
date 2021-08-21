@@ -6,7 +6,6 @@
 extern "C" {
 #include <libyasm.h>
 #include <libyasm/bitvect.h>
-//#include <modules/arch/x86/x86arch.h>
 }
 
 template <typename Type, typename Base, typename Module, yasm_module_type type>
@@ -91,7 +90,8 @@ void check_errors(const YasmErrwarns& errwarns, const YasmLinemap& linemap)
     {
         yasm_errwarns_output_all
             ( errwarns, linemap, warning_error
-            , print_error, print_warning);
+            , print_error, print_warning
+            );
         throw std::runtime_error("Exiting because of the above errors");
     }
 }
@@ -117,20 +117,51 @@ auto instruction(const YasmArch::Unique& arch, const char opcode[len])
     return bc;
 }
 
-auto gen_int3h(const YasmArch::Unique& arch) -> yasm_bytecode*
+auto gen_int(const YasmArch::Unique& arch, unsigned long value) -> yasm_bytecode*
 {
     auto* bc = instruction<3>(arch, "int");
     yasm_insn* insn = yasm_bc_get_insn(bc);
-    // create operand 3h
-    yasm_intnum* value_3 = yasm_intnum_create_uint(3);
-    yasm_expr__item* item_3 = yasm_expr_int(value_3);
-    yasm_expr* expr_3 = yasm_expr_create(YASM_EXPR_IDENT, item_3, nullptr, 1);
-    yasm_insn_operand* op_3 = yasm_operand_create_imm(expr_3);
+    // create operand
+    yasm_intnum* value_long = yasm_intnum_create_uint(value);
+    yasm_expr__item* item_long = yasm_expr_int(value_long);
+    yasm_expr* expr_long = yasm_expr_create(YASM_EXPR_IDENT, item_long, nullptr, 1);
+    yasm_insn_operand* op_long = yasm_operand_create_imm(expr_long);
     // append to instruction
-    auto* t = yasm_insn_ops_append(insn, op_3);
-    if (!t) {
+    if (auto* t = yasm_insn_ops_append(insn, op_long); not t) {
         std::cout << "could not append operand" << std::endl;
     }
+    return bc;
+}
+
+auto gen_mov_reg(const YasmArch::Unique& arch, const char* regname, unsigned long value) -> yasm_bytecode*
+{
+    uintptr_t reg_value;
+    auto r = yasm_arch_parse_check_regtmod(arch.get(), regname, std::strlen(regname), &reg_value);
+    if (r != YASM_ARCH_REG) {
+        throw std::logic_error("Not a register " + std::to_string(r));
+    }
+
+    auto* bc = instruction<3>(arch, "mov");
+    yasm_insn* insn = yasm_bc_get_insn(bc);
+
+    yasm_expr__item* item_reg = yasm_expr_reg(reg_value);
+    yasm_expr* expr_reg = yasm_expr_create(YASM_EXPR_IDENT, item_reg, nullptr, 1);
+    yasm_insn_operand* op_reg = yasm_operand_create_imm(expr_reg);
+    // append to instruction
+    if (auto* t = yasm_insn_ops_append(insn, op_reg); not t) {
+        std::cout << "could not append operand reg" << std::endl;
+    }
+
+    // create operand from ulong
+    yasm_intnum* value_long = yasm_intnum_create_uint(value);
+    yasm_expr__item* item_long = yasm_expr_int(value_long);
+    yasm_expr* expr_long = yasm_expr_create(YASM_EXPR_IDENT, item_long, nullptr, 1);
+    yasm_insn_operand* op_long = yasm_operand_create_imm(expr_long);
+    // append to instruction
+    if (auto* t = yasm_insn_ops_append(insn, op_long); not t) {
+        std::cout << "could not append operand long" << std::endl;
+    }
+
     return bc;
 }
 
@@ -145,7 +176,7 @@ int main()
     yasm_floatnum_initialize();
     yasm_errwarn_initialize();
 
-    const char* output_name = "assembled.elf";
+    const char* output_name = "assembled.o";
 
     std::cout << "\navailable arch modules:" << std::endl;
     YasmArch::list_modules();
@@ -165,13 +196,15 @@ int main()
         return 1;
     }
 
+    if (auto t = yasm_arch_set_var(arch.get(), "mode_bits", 64); not t) {
+        std::cout << "could not set 64 bit mode" << std::endl;
+    }
+
     /* create empty errwarns (not sure if really empty) */
     YasmErrwarns errwarns;
     /* create identity linemap (not sure if really identity) */
     YasmLinemap linemap;
     yasm_linemap_set(linemap, "-", 0, 1, 1);
-//    /* create symbol table for program */
-//    YasmSymtab symtab;
 
     /* list and create objfmt */
     std::cout << "\navailable objfmts:" << std::endl;
@@ -191,46 +224,136 @@ int main()
 
     auto* symtab = object->symtab;
 
+    /* get section .text */
     std::cout << std::endl;
     int is_new_section = 0;
+    // text should already exist
     yasm_section* section_text = yasm_object_get_general(object, ".text", 16, true /* is code */, false /* not bss */, &is_new_section, 1);
-    std::cout << (is_new_section ? ".text created" : ".text already existed") << std::endl;
-    yasm_section* section_rodata = yasm_object_get_general(object, ".rodata", 32, false /* is code */, false /* not bss */, &is_new_section, 1);
-    std::cout << (is_new_section ? ".data created" : ".data already existed") << std::endl;
-
-    yasm_bytecode* empty_bc = x86_module->create_empty_insn(arch.get(), 1);
-    if (auto t = yasm_section_bcs_append(section_text, empty_bc); not t) {
-        std::cerr << "failed to append bytecode to section text" << std::endl;
+    if (is_new_section) {
+        std::cout << ".text was created, this shouldn't happen" << std::endl;
     }
-    yasm_symrec* start_sym = yasm_symtab_define_label
-        ( symtab, "_start"
-        , empty_bc, 1, 1 /* fake line */
+    /* create section .data with correct (default) params */
+    yasm_valparamhead vps;
+    yasm_vps_initialize(&vps);
+    auto* data_identifier = yasm__xstrdup(".data");
+    yasm_valparam* vp = yasm_vp_create_id(nullptr, data_identifier, '\0');
+    yasm_vps_append(&vps, vp);
+    yasm_section* section_data = yasm_objfmt_section_switch(object, &vps, nullptr, 1 /* fake line */);
+
+    yasm_bytecode* bc;
+
+    /*****************/
+    /* section .data */
+
+    /* start and symbol for msg */
+
+    bc = x86_module->create_empty_insn(arch.get(), 1);
+    if (auto t = yasm_section_bcs_append(section_data, bc); not t) {
+        std::cerr << "failed to append bytecode to section data" << std::endl;
+    }
+    yasm_symtab_define_label
+        ( symtab, "msg"
+        , bc, 1 /* is insered into table */, 1 /* fake line */
         );
-    yasm_symrec_declare(start_sym, YASM_SYM_GLOBAL, 1 /* fake line */);
 
-    yasm_bytecode* code_bc = gen_int3h(arch);
-    if (auto t = yasm_section_bcs_append(section_text, code_bc); not t) {
-        std::cerr << "failed to append bytecode to section text" << std::endl;
-    }
+    /* data for msg */
 
-    constexpr const char content_str_lit[] = "kto prochital tot objdump";
-    auto* content_str = (char*)yasm_xmalloc(std::size(content_str_lit));
-    std::strcpy(content_str, content_str_lit);
+    constexpr const char content_str_lit[] = "Hello, World\n";
+    auto* content_str = yasm__xstrdup(content_str_lit);
     yasm_dataval* string_val = yasm_dv_create_string(content_str, std::size(content_str_lit) - 1);
     auto* datavals = (yasm_datavalhead*)yasm_xmalloc(sizeof(yasm_datavalhead));
     yasm_dvs_initialize(datavals);
     yasm_dvs_append(datavals, string_val);
-
-    std::cout << "\nbytecode appended to data:" << std::endl;
-    yasm_dvs_print(datavals, stdout, 0);
-    auto* data_bc = yasm_bc_create_data
-        ( datavals, std::size(content_str_lit)
+    bc = yasm_bc_create_data
+        ( datavals, std::size(content_str_lit) - 1
         , 0 /* do not append zero */
         , arch.get(), 1
         );
-
-    if (auto t = yasm_section_bcs_append(section_rodata, data_bc); not t) {
+    // finally append
+    if (auto t = yasm_section_bcs_append(section_data, bc); not t) {
         std::cerr << "failed to append bytecode to section data" << std::endl;
+    }
+
+    /*****************/
+    /* section .text */
+
+    /* symbol for start */
+    bc = x86_module->create_empty_insn(arch.get(), 1);
+    if (auto t = yasm_section_bcs_append(section_text, bc); not t) {
+        std::cerr << "failed to append bytecode to section text" << std::endl;
+    }
+    yasm_symrec* start_sym = yasm_symtab_define_label
+        ( symtab, "_start"
+        , bc, 1, 1 /* fake line */
+        );
+    yasm_symrec_declare(start_sym, YASM_SYM_GLOBAL, 1 /* fake line */);
+
+    /* mov rax, 1 (sys_write) */
+    bc = gen_mov_reg(arch, "rax", 1);
+    if (auto t = yasm_section_bcs_append(section_text, bc); not t) {
+        std::cerr << "failed to append bytecode to section text" << std::endl;
+    }
+    /* mov rdi, 1 (stdout) */
+    bc = gen_mov_reg(arch, "rdi", 1);
+    if (auto t = yasm_section_bcs_append(section_text, bc); not t) {
+        std::cerr << "failed to append bytecode to section text" << std::endl;
+    }
+    /* mov rsi, msg  */
+    // create instruction
+    bc = instruction<3>(arch, "mov");
+    yasm_insn* insn = yasm_bc_get_insn(bc);
+    // create register
+    uintptr_t reg_value;
+    auto r = yasm_arch_parse_check_regtmod(arch.get(), "rsi", 3, &reg_value);
+    if (r != YASM_ARCH_REG) {
+        throw std::logic_error("Not a register " + std::to_string(r));
+    }
+    // register to operand
+    yasm_expr__item* item_reg = yasm_expr_reg(reg_value);
+    yasm_expr* expr_reg = yasm_expr_create(YASM_EXPR_IDENT, item_reg, nullptr, 1);
+    yasm_insn_operand* op_reg = yasm_operand_create_imm(expr_reg);
+    // append to instruction
+    if (auto* t = yasm_insn_ops_append(insn, op_reg); not t) {
+        std::cout << "could not append operand reg" << std::endl;
+    }
+    // create operand from label
+    yasm_symrec* msg_sym_used = yasm_symtab_use(symtab, "msg", 1 /* fake line */);
+    yasm_expr__item* item_sym = yasm_expr_sym(msg_sym_used);
+    yasm_expr* expr_sym = yasm_expr_create(YASM_EXPR_IDENT, item_sym, nullptr, 1);
+    yasm_insn_operand* op_sym = yasm_operand_create_imm(expr_sym);
+    // append to instruction
+    if (auto* t = yasm_insn_ops_append(insn, op_sym); not t) {
+        std::cout << "could not append operand sym" << std::endl;
+    }
+    // append instruction itself
+    if (auto t = yasm_section_bcs_append(section_text, bc); not t) {
+        std::cerr << "failed to append bytecode to section text" << std::endl;
+    }
+    /* mov rdx, strlen(msg) */
+    bc = gen_mov_reg(arch, "rdx", std::size(content_str_lit) - 1);
+    if (auto t = yasm_section_bcs_append(section_text, bc); not t) {
+        std::cerr << "failed to append bytecode to section text" << std::endl;
+    }
+    /* syscall */
+    bc = instruction<7>(arch, "syscall");
+    if (auto t = yasm_section_bcs_append(section_text, bc); not t) {
+        std::cerr << "failed to append bytecode to section text" << std::endl;
+    }
+
+    /* mov rax, 60 */
+    bc = gen_mov_reg(arch, "rax", 60);
+    if (auto t = yasm_section_bcs_append(section_text, bc); not t) {
+        std::cerr << "failed to append bytecode to section text" << std::endl;
+    }
+    /* mov rdi, 228 */
+    bc = gen_mov_reg(arch, "rdi", 228);
+    if (auto t = yasm_section_bcs_append(section_text, bc); not t) {
+        std::cerr << "failed to append bytecode to section text" << std::endl;
+    }
+    /* syscall */
+    bc = instruction<7>(arch, "syscall");
+    if (auto t = yasm_section_bcs_append(section_text, bc); not t) {
+        std::cerr << "failed to append bytecode to section text" << std::endl;
     }
 
     /* Finalize after adding bytecode */

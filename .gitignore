@@ -1,5 +1,5 @@
 /main
-/assembled.elf
+/assembled
 *.o
 /compile_commands.json
 /.cache/
