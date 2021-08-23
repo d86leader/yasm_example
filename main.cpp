@@ -81,6 +81,17 @@ using YasmErrwarns = YasmObject<yasm_errwarns, &yasm_errwarns_create, &yasm_errw
 using YasmLinemap = YasmObject<yasm_linemap, &yasm_linemap_create, &yasm_linemap_destroy>;
 using YasmSymtab = YasmObject<yasm_symtab, &yasm_symtab_create, &yasm_symtab_destroy>;
 
+struct YasmObjectFileDeleter {
+    void operator() (yasm_object* p) {
+        // to avoid double-freeing the arch that is managed by its own unique ptr
+        p->arch = nullptr;
+        yasm_object_destroy(p);
+    }
+};
+
+using YasmObjectFile = std::unique_ptr<yasm_object, YasmObjectFileDeleter>;
+
+
 void check_errors(const YasmErrwarns& errwarns, const YasmLinemap& linemap)
 {
     int warning_error = 1; // treat warnings as errors
@@ -266,10 +277,10 @@ int main()
     auto dbgfmt = YasmDbgfmt::load_module("null");
 
     /* create elf-object-file representative */
-    auto* object = yasm_object_create
+    auto object = YasmObjectFile(yasm_object_create
         ( "-", output_name, arch.get()
         , objfmt, dbgfmt
-        );
+        ));
 
     auto* symtab = object->symtab;
 
@@ -277,7 +288,7 @@ int main()
     std::cout << std::endl;
     int is_new_section = 0;
     // text should already exist
-    yasm_section* section_text = yasm_object_get_general(object, ".text", 16, true /* is code */, false /* not bss */, &is_new_section, 1);
+    yasm_section* section_text = yasm_object_get_general(object.get(), ".text", 16, true /* is code */, false /* not bss */, &is_new_section, 1);
     if (is_new_section) {
         std::cout << ".text was created, this shouldn't happen" << std::endl;
     }
@@ -287,7 +298,8 @@ int main()
     auto* data_identifier = yasm__xstrdup(".data");
     yasm_valparam* vp = yasm_vp_create_id(nullptr, data_identifier, '\0');
     yasm_vps_append(&vps, vp);
-    yasm_section* section_data = yasm_objfmt_section_switch(object, &vps, nullptr, next_fake_line());
+    yasm_section* section_data = yasm_objfmt_section_switch(object.get(), &vps, nullptr, next_fake_line());
+    yasm_vps_delete(&vps);
 
     yasm_bytecode* bc;
 
@@ -310,11 +322,11 @@ int main()
     constexpr const char content_str_lit[] = "Hello, World\n";
     auto* content_str = yasm__xstrdup(content_str_lit);
     yasm_dataval* string_val = yasm_dv_create_string(content_str, std::size(content_str_lit) - 1);
-    auto* datavals = (yasm_datavalhead*)yasm_xmalloc(sizeof(yasm_datavalhead));
-    yasm_dvs_initialize(datavals);
-    yasm_dvs_append(datavals, string_val);
+    yasm_datavalhead datavals;
+    yasm_dvs_initialize(&datavals);
+    yasm_dvs_append(&datavals, string_val);
     bc = yasm_bc_create_data
-        ( datavals, std::size(content_str_lit) - 1
+        ( &datavals, std::size(content_str_lit) - 1
         , 0 /* do not append zero */
         , arch.get(), 1
         );
@@ -434,22 +446,27 @@ int main()
     /* Finalize after adding bytecode */
     yasm_symtab_parser_finalize(symtab, 0, errwarns);
     check_errors(errwarns, linemap);
-    yasm_object_finalize(object, errwarns);
+    yasm_object_finalize(object.get(), errwarns);
     check_errors(errwarns, linemap);
 
     /* Optimize */
-    yasm_object_optimize(object, errwarns);
+    yasm_object_optimize(object.get(), errwarns);
     check_errors(errwarns, linemap);
 
     /* Generate any debugging information */
-    yasm_dbgfmt_generate(object, linemap, errwarns);
+    yasm_dbgfmt_generate(object.get(), linemap, errwarns);
     check_errors(errwarns, linemap);
 
     /* Write to file */
     FILE* output = fopen(output_name, "wb");
-    yasm_objfmt_output(object, output, 0, errwarns);
+    yasm_objfmt_output(object.get(), output, 0, errwarns);
     fclose(output);
     check_errors(errwarns, linemap);
+
+    yasm_intnum_cleanup();
+    yasm_floatnum_cleanup();
+    yasm_errwarn_cleanup();
+    BitVector_Shutdown();
 
     return 0;
 }

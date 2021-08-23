@@ -4,3 +4,4 @@
 /compile_commands.json
 /.cache/
 .cpptags
+CMakeLists.txt.user
