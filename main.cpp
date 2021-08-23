@@ -8,6 +8,14 @@ extern "C" {
 #include <libyasm/bitvect.h>
 }
 
+
+long _fake_line = 1;
+auto next_fake_line(long base = 0) -> long {
+    auto r = base + _fake_line;
+    _fake_line += 1;
+    return r;
+}
+
 template <typename Type, typename Base, typename Module, yasm_module_type type>
 struct YasmModuleTraits {
     struct Deleter {
@@ -96,6 +104,63 @@ void check_errors(const YasmErrwarns& errwarns, const YasmLinemap& linemap)
     }
 }
 
+auto make_effaddr(const YasmArch::Unique& arch, const char* basereg_name, const char* indreg_name, unsigned long shift, unsigned long offset)
+    -> yasm_effaddr*
+{
+    uintptr_t basereg_reg;
+    if ( auto r = yasm_arch_parse_check_regtmod
+            ( arch.get()
+            , basereg_name, std::strlen(basereg_name)
+            , &basereg_reg
+            )
+       ; r != YASM_ARCH_REG
+       ) {
+        throw std::logic_error("Not a register " + std::to_string(r));
+    }
+    uintptr_t indreg_reg;
+    if ( auto r = yasm_arch_parse_check_regtmod
+            ( arch.get()
+            , indreg_name, std::strlen(indreg_name)
+            , &indreg_reg
+            )
+       ; r != YASM_ARCH_REG
+       ) {
+        throw std::logic_error("Not a register " + std::to_string(r));
+    }
+
+    auto check_null = [](auto* p) {
+        if (p == nullptr) {
+            throw std::runtime_error("Nullptr in expr creation");
+        }
+    };
+
+    yasm_expr__item* basereg_item = yasm_expr_reg(basereg_reg);
+    check_null(basereg_item);
+    yasm_expr__item* indreg_item = yasm_expr_reg(indreg_reg);
+    check_null(indreg_item);
+    yasm_expr__item* offset_item = yasm_expr_int(yasm_intnum_create_uint(offset));
+    check_null(offset_item);
+    yasm_expr__item* shift_item = yasm_expr_int(yasm_intnum_create_uint(shift));
+    check_null(shift_item);
+
+    yasm_expr__item* shifted_index = yasm_expr_expr(yasm_expr_create
+        (YASM_EXPR_SHL, indreg_item, shift_item, 101));
+    check_null(shifted_index);
+    yasm_expr__item* index_plus_base = yasm_expr_expr(yasm_expr_create
+        (YASM_EXPR_ADD, basereg_item, shifted_index, 102));
+    check_null(index_plus_base);
+    yasm_expr* final_sum = yasm_expr_create
+        (YASM_EXPR_ADD, offset_item, index_plus_base, 103);
+    check_null(final_sum);
+
+    auto* ea = yasm_arch_ea_create(arch.get(), final_sum);
+    if (ea == nullptr) {
+        throw std::runtime_error("Could not create effective address");
+    }
+
+    return ea;
+}
+
 template <size_t len>
 auto instruction(const YasmArch::Unique& arch, const char opcode[len])
     -> yasm_bytecode*
@@ -105,7 +170,7 @@ auto instruction(const YasmArch::Unique& arch, const char opcode[len])
     auto type = yasm_arch_parse_check_insnprefix
         ( arch.get()
         , opcode, len
-        , 1 /* fake line number */
+        , next_fake_line(200)
         , &bc, &prefix
         );
     if (type != YASM_ARCH_INSN) {
@@ -113,22 +178,6 @@ auto instruction(const YasmArch::Unique& arch, const char opcode[len])
     }
     if (!bc) {
         throw std::logic_error("No bytecode generated");
-    }
-    return bc;
-}
-
-auto gen_int(const YasmArch::Unique& arch, unsigned long value) -> yasm_bytecode*
-{
-    auto* bc = instruction<3>(arch, "int");
-    yasm_insn* insn = yasm_bc_get_insn(bc);
-    // create operand
-    yasm_intnum* value_long = yasm_intnum_create_uint(value);
-    yasm_expr__item* item_long = yasm_expr_int(value_long);
-    yasm_expr* expr_long = yasm_expr_create(YASM_EXPR_IDENT, item_long, nullptr, 1);
-    yasm_insn_operand* op_long = yasm_operand_create_imm(expr_long);
-    // append to instruction
-    if (auto* t = yasm_insn_ops_append(insn, op_long); not t) {
-        std::cout << "could not append operand" << std::endl;
     }
     return bc;
 }
@@ -238,7 +287,7 @@ int main()
     auto* data_identifier = yasm__xstrdup(".data");
     yasm_valparam* vp = yasm_vp_create_id(nullptr, data_identifier, '\0');
     yasm_vps_append(&vps, vp);
-    yasm_section* section_data = yasm_objfmt_section_switch(object, &vps, nullptr, 1 /* fake line */);
+    yasm_section* section_data = yasm_objfmt_section_switch(object, &vps, nullptr, next_fake_line());
 
     yasm_bytecode* bc;
 
@@ -253,7 +302,7 @@ int main()
     }
     yasm_symtab_define_label
         ( symtab, "msg"
-        , bc, 1 /* is insered into table */, 1 /* fake line */
+        , bc, 1 /* is insered into table */, next_fake_line()
         );
 
     /* data for msg */
@@ -284,9 +333,9 @@ int main()
     }
     yasm_symrec* start_sym = yasm_symtab_define_label
         ( symtab, "_start"
-        , bc, 1, 1 /* fake line */
+        , bc, 1, next_fake_line()
         );
-    yasm_symrec_declare(start_sym, YASM_SYM_GLOBAL, 1 /* fake line */);
+    yasm_symrec_declare(start_sym, YASM_SYM_GLOBAL, next_fake_line());
 
     /* mov rax, 1 (sys_write) */
     bc = gen_mov_reg(arch, "rax", 1);
@@ -298,12 +347,38 @@ int main()
     if (auto t = yasm_section_bcs_append(section_text, bc); not t) {
         std::cerr << "failed to append bytecode to section text" << std::endl;
     }
-    /* mov rsi, msg  */
+    /* slight interjection: mov word ptr [0x402000 + rax + rdi<<0], 'ww' */
     // create instruction
     bc = instruction<3>(arch, "mov");
     yasm_insn* insn = yasm_bc_get_insn(bc);
+    // create effective address
+    yasm_effaddr* ea = make_effaddr(arch, "rax", "rdi", 0, 0x402000);
+    ea->data_len = 2;
+    // ea to operand
+    yasm_insn_operand* op_ea = yasm_operand_create_mem(ea);
+    // append to instruction
+    if (auto* t = yasm_insn_ops_append(insn, op_ea); not t) {
+        std::cout << "could not append operand address" << std::endl;
+    }
+    // create int operand
+    yasm_expr__item* item_72 = yasm_expr_int(yasm_intnum_create_uint(0x7777));
+    yasm_expr* expr_72 = yasm_expr_create(YASM_EXPR_IDENT, item_72, nullptr, 104);
+    yasm_insn_operand* op_72 = yasm_operand_create_imm(expr_72);
+    // append to instruction
+    if (auto* t = yasm_insn_ops_append(insn, op_72); not t) {
+        std::cout << "could not append operand address" << std::endl;
+    }
+    // append instruction itself
+    if (auto t = yasm_section_bcs_append(section_text, bc); not t) {
+        std::cerr << "failed to append bytecode to section text" << std::endl;
+    }
+
+    /* mov rsi, msg  */
+    // create instruction
+    bc = instruction<3>(arch, "mov");
+    insn = yasm_bc_get_insn(bc);
     // create register
-    uintptr_t reg_value;
+    uintptr_t reg_value = 0;
     auto r = yasm_arch_parse_check_regtmod(arch.get(), "rsi", 3, &reg_value);
     if (r != YASM_ARCH_REG) {
         throw std::logic_error("Not a register " + std::to_string(r));
@@ -317,7 +392,7 @@ int main()
         std::cout << "could not append operand reg" << std::endl;
     }
     // create operand from label
-    yasm_symrec* msg_sym_used = yasm_symtab_use(symtab, "msg", 1 /* fake line */);
+    yasm_symrec* msg_sym_used = yasm_symtab_use(symtab, "msg", next_fake_line());
     yasm_expr__item* item_sym = yasm_expr_sym(msg_sym_used);
     yasm_expr* expr_sym = yasm_expr_create(YASM_EXPR_IDENT, item_sym, nullptr, 1);
     yasm_insn_operand* op_sym = yasm_operand_create_imm(expr_sym);
