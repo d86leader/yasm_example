@@ -6,6 +6,8 @@
 extern "C" {
 #include <libyasm.h>
 #include <libyasm/bitvect.h>
+
+void yasm_init_plugin();
 }
 
 
@@ -52,7 +54,6 @@ struct YasmModuleTraits {
 using YasmArch = YasmModuleTraits<yasm_arch, yasm_arch_base, yasm_arch_module, YASM_MODULE_ARCH>;
 using YasmObjfmt = YasmModuleTraits<yasm_objfmt, yasm_objfmt_base, yasm_objfmt_module, YASM_MODULE_OBJFMT>;
 using YasmDbgfmt = YasmModuleTraits<yasm_dbgfmt, yasm_dbgfmt_base, yasm_dbgfmt_module, YASM_MODULE_DBGFMT>;
-using YasmPreproc = YasmModuleTraits<yasm_preproc, yasm_preproc_base, yasm_preproc_module, YASM_MODULE_PREPROC>;
 
 template <typename Type, Type* (*create) (), void (*destroy) (Type*)>
 class YasmObject {
@@ -235,6 +236,7 @@ int main()
     yasm_intnum_initialize();
     yasm_floatnum_initialize();
     yasm_errwarn_initialize();
+    yasm_init_plugin();
 
     const char* output_name = "assembled.o";
 
